@@ -126,6 +126,38 @@ Midea's own service manuals ship the override, they just don't tell owners:
   within 5 s while off): compressor at a fixed mid frequency (F2) for 30
   minutes, then reverts to auto/24 °C. Service/pump-down use.
 
+## What the UART will *not* do: spoof the room temperature
+
+The obvious software-only trick — tell the unit over the service port that
+the room is 30 °C so it stops coasting — was tested exhaustively on this
+unit (firmware v1.5.0's `/probe` endpoint sends raw frames) and does not
+exist:
+
+- The **0x40 control frame** honours exactly the documented fields
+  (power, mode, setpoint, fan, timers, swing, eco/turbo/sleep, display,
+  freeze-protect). Every other byte (6, 8–23) was written one at a time
+  with a temperature-shaped value; the unit accepted each frame, echoed a
+  C0 with its *real* T1 reading, and nothing persisted. Byte 22 is echoed
+  back in the reply but not stored (a message-ID slot, not a sensor).
+- The **0x41 query** ignores its subtype byte entirely — 0x00, 0x01,
+  0x11, 0x20, 0x41, 0xA1, 0xC1, 0xE1, 0xFF all return the same C0 as
+  0x81. Only 0x21 (C1 engineering groups) and the 0x61 display toggle
+  have distinct handlers.
+- The **B0/B1 property protocol** (where newer units expose extras such
+  as "remote temperature") is absent: no response. Only B5 (capabilities)
+  answers.
+- The electronic-ID query returns all 0xFF (never programmed).
+
+The reason is structural: *Follow Me* lives in the IR decoder. The remote
+sends its own thermistor reading in every IR frame, and the indoor board
+substitutes it for T1 while those frames keep arriving. The UART path was
+written for cloud dongles, which have no sensor of their own, so no
+"remote temperature" field was ever added to the 0x40 command on this
+generation. To spoof the room temperature you must either speak IR (a
+940 nm LED on a spare GPIO of the dongle would do it) or change what the
+T1 thermistor sees — which is GreatScott's resistor trick, just on the
+indoor sensor instead of the outdoor one.
+
 ## Reproducing this
 
 Flash the dongle (see [README](README.md)), let it run a few days, then:
