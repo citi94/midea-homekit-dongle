@@ -27,7 +27,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.4.0"
+#define FIRMWARE_VERSION "1.5.0"
 
 using namespace dudanov::midea::ac;
 
@@ -105,6 +105,29 @@ class AirConditionerEx : public AirConditioner {
         });
   }
   bool groupDead(uint8_t g) const { return m_fails[g] >= DEAD; }
+
+  // Bus REPL for /probe: send one arbitrary frame, capture whatever comes
+  // back. Prospecting, not parsing — the handler accepts ANY response frame,
+  // so don't probe while you care about a poll completing correctly.
+  String probeResp;
+  bool probeDone = true;
+  void probeFrame(uint8_t type, dudanov::midea::FrameData data) {
+    using namespace dudanov::midea;
+    probeResp = "";
+    probeDone = false;
+    m_queueRequestPriority(static_cast<FrameType>(type), std::move(data),
+        [this](FrameData d) -> ResponseStatus {
+          char b[4];
+          for (uint8_t i = 0; i < d.size(); i++) {
+            snprintf(b, sizeof(b), "%02x", d.data()[i]);
+            probeResp += b;
+          }
+          probeDone = true;
+          return ResponseStatus::RESPONSE_OK;
+        },
+        nullptr,
+        [this]() { probeDone = true; });  // retries exhausted, no response
+  }
 
  private:
   static constexpr int8_t DEAD = 127;
@@ -914,6 +937,93 @@ static void mideaLogger(int level, const char *tag, int line, String format, va_
     WEBLOG("MideaUART %s: %s", level == 1 ? "ERROR" : "WARN", buf);
 }
 
+// Bus REPL: /probe?type=03&hex=41210144...[&crc=0]
+// Sends one raw frame body to the AC (body CRC appended unless crc=0; the
+// outer 0xAA framing/checksum is the library's job) and waits up to ~4s for
+// the reply, returned as hex. type is the frame-type byte: 03 = query
+// (safe, read-only), 02 = control (changes state — know what you're
+// sending). Hex may contain spaces. Prospecting tool for unmapped protocol
+// space; the flight recorder catches any behavioral side effects.
+static void handleProbe() {
+  const String hex = dash.arg("hex");
+  const uint8_t type = strtol(dash.arg("type").c_str(), nullptr, 16);
+  uint8_t body[48];
+  int n = 0, hi = -1;
+  for (size_t i = 0; i < hex.length(); i++) {
+    const char ch = hex[i];
+    int v;
+    if (ch >= '0' && ch <= '9') v = ch - '0';
+    else if (ch >= 'a' && ch <= 'f') v = ch - 'a' + 10;
+    else if (ch >= 'A' && ch <= 'F') v = ch - 'A' + 10;
+    else continue;  // tolerate spaces / commas / 0x prefixes
+    if (hi < 0) { hi = v; continue; }
+    if (n >= (int)sizeof(body)) { dash.send(400, "text/plain", "body too long\n"); return; }
+    body[n++] = hi << 4 | v;
+    hi = -1;
+  }
+  if (!n || hi >= 0 || !type) {
+    dash.send(400, "text/plain", "usage: /probe?type=03&hex=4121014400...[&crc=0]\n");
+    return;
+  }
+  dudanov::midea::FrameData d(body, n);
+  if (dash.arg("crc") != "0") d.appendCRC();
+  ac.probeFrame(type, std::move(d));
+  // Pump the AC link synchronously so curl gets the answer in one shot.
+  // We're inside dash.handleClient() here, so ac.loop() is not re-entered.
+  const uint32_t t0 = millis();
+  while (!ac.probeDone && millis() - t0 < 4000) {
+    ac.loop();
+    delay(2);
+  }
+  dash.send(200, "text/plain",
+            ac.probeResp.length() ? ac.probeResp + "\n" : String("(no response)\n"));
+}
+
+// IR-button combo replay over UART twins: LED button -> displayToggle
+// (0x41/0x61 frame), SWING -> swing change, TURBO -> preset toggle. Paced
+// like keypresses; the service-manual combos want all presses within 10s.
+//   /combo?seq=inquiry  = LED x3 + SWING x3  (RG57 parameter-check entry)
+//   /combo?seq=turbo6   = TURBO x6           (MSV1 rating-capacity test)
+static constexpr uint32_t COMBO_STEP_MS = 1400;
+static char comboSteps[8];
+static int comboLen = 0, comboNext = 0;
+static uint32_t comboLastMs = 0;
+
+static void comboTick() {
+  if (comboNext >= comboLen) return;
+  if (comboNext > 0 && millis() - comboLastMs < COMBO_STEP_MS) return;
+  comboLastMs = millis();
+  const char step = comboSteps[comboNext++];
+  if (step == 'L') {
+    ac.displayToggle();
+  } else if (step == 'S') {
+    Control c;
+    c.swingMode = (ac.getSwingMode() == SwingMode::SWING_OFF)
+                      ? SwingMode::SWING_BOTH : SwingMode::SWING_OFF;
+    ac.control(c);
+  } else {  // 'T'
+    Control c;
+    c.preset = (ac.getPreset() == Preset::PRESET_TURBO)
+                   ? Preset::PRESET_NONE : Preset::PRESET_TURBO;
+    ac.control(c);
+  }
+}
+
+static void handleCombo() {
+  const String seq = dash.arg("seq");
+  const char *steps;
+  if (seq == "inquiry")     steps = "LLLSSS";
+  else if (seq == "turbo6") steps = "TTTTTT";
+  else { dash.send(400, "text/plain", "usage: /combo?seq=inquiry|turbo6\n"); return; }
+  comboLen = strlen(steps);
+  memcpy(comboSteps, steps, comboLen);
+  comboNext = 0;
+  comboLastMs = 0;  // first step fires on the next loop pass
+  dash.send(200, "text/plain",
+            String("firing ") + seq + ": " + steps + ", one step per " +
+            (unsigned)COMBO_STEP_MS + "ms — listen for the 2s buzzer\n");
+}
+
 void setup() {
   Serial.begin(115200);  // USB console: HomeSpan CLI + logs
 
@@ -1000,6 +1110,8 @@ void setup() {
   dash.on("/api", handleApi);
   dash.on("/log.csv", handleLogCsv);  // 3-day flight recorder, streamed
   dash.on("/events", handleEvents);   // state transitions with timestamps
+  dash.on("/probe", handleProbe);     // bus REPL: raw frame in, raw frame out
+  dash.on("/combo", handleCombo);     // IR button combos via UART twins
   // Raw NVS partition dump: full identity backup (WiFi credentials + HomeKit
   // pairing keys). Restore to a spare board with:
   //   curl -o nvs.bin http://192.168.2.10:8080/nvsdump
@@ -1032,4 +1144,5 @@ void loop() {
   dash.handleClient();
   recorderTick();
   telemetryTick();
+  comboTick();
 }
