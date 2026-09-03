@@ -1,0 +1,6 @@
+.pio/
+secrets.ini
+src/secrets.h
+.claude/
+.DS_Store
+.vscode/
