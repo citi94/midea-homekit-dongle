@@ -43,6 +43,13 @@ h1 small{color:var(--muted);font-weight:400;font-size:12px;margin-left:auto}
 .badge{background:var(--surface);border:1px solid var(--ring);border-radius:999px;
   padding:4px 12px;font-size:13px;color:var(--ink2)}
 .badge b{color:var(--ink);font-weight:600}
+.ad{display:flex;flex-wrap:wrap;gap:10px;align-items:center;font-size:13px;color:var(--ink2)}
+.ad input{width:3.5em;background:var(--page);color:var(--ink);border:1px solid var(--ring);
+  border-radius:6px;padding:4px 6px;font:inherit}
+.btn{background:var(--surface);color:var(--ink);border:1px solid var(--ring);border-radius:8px;
+  padding:6px 14px;font:inherit;font-weight:600;cursor:pointer}
+.btn.on{background:#199e70;border-color:#199e70;color:#fff}
+.ad .st{flex-basis:100%;color:var(--muted)}
 .card{background:var(--surface);border:1px solid var(--ring);border-radius:10px;
   padding:14px;margin-bottom:14px}
 .card h2{font-size:13px;font-weight:600;color:var(--ink2);margin-bottom:8px}
@@ -100,6 +107,16 @@ canvas{width:100%;height:220px;display:block}
 <div class="card" id="teleCard" style="display:none">
   <h2>Refrigerant circuit &amp; fans</h2>
   <div class="kgrid" id="kgrid"></div>
+</div>
+
+<div class="card"><h2>Absent drying</h2>
+  <div class="ad">
+    <button class="btn" id="adBtn" onclick="adToggle()">–</button>
+    <span>heat 30° <input id="adHeat" type="number" min="5" max="180"> min</span>
+    <span>cool 17° <input id="adCool" type="number" min="5" max="180"> min</span>
+    <span>until <input id="adEnd" type="time" style="width:6.5em"> → auto 20°</span>
+    <span class="st" id="adSt">alternates heat and cool to dry out a wet room while nobody is in</span>
+  </div>
 </div>
 
 <div class="card"><h2>System</h2><div class="sys" id="sys"></div></div>
@@ -201,6 +218,28 @@ var hzChart=makeChart('ch2','tip2',{unit:'Hz',zeroBase:true,series:[
 function badge(k,v){return '<span class="badge">'+k+' <b>'+v+'</b></span>'}
 function krow(k,v){return '<div><span>'+k+'</span><b>'+v+'</b></div>'}
 
+function adToggle(){
+  var on=D&&D.awayDry&&D.awayDry.on;
+  var q=on?'/awaydry?on=0':'/awaydry?on=1&heat='+
+    document.getElementById('adHeat').value+'&cool='+document.getElementById('adCool').value;
+  var t=document.getElementById('adEnd').value;
+  if(!on&&t){var d=new Date(),hm=t.split(':');d.setHours(+hm[0],+hm[1],0,0);
+    if(d<=new Date())d.setDate(d.getDate()+1);q+='&end='+Math.floor(d/1000)}
+  fetch(q).then(function(){poll()});
+}
+function mmss(s){return Math.floor(s/60)+':'+('0'+(s%60)).slice(-2)}
+function adRender(a){
+  if(!a)return;
+  var b=document.getElementById('adBtn');
+  b.className='btn'+(a.on?' on':'');b.textContent=a.on?'ON — stop':'Start';
+  ['adHeat','adCool'].forEach(function(id,i){var e=document.getElementById(id);
+    if(document.activeElement!==e)e.value=i?a.coolMin:a.heatMin;});
+  document.getElementById('adSt').textContent=a.on?
+    (a.phase==='heat'?'heating to 30° — loading the air with water, ':
+     'cooling at 17° — condensing it out, ')+mmss(a.left)+' left in this phase'+
+    (a.end?', auto 20° at '+hm(new Date(a.end*1000)):''):
+    'alternates heat and cool to dry out a wet room while nobody is in';
+}
 function poll(){
   fetch('/api').then(function(r){return r.json()}).then(function(d){
     D=d;
@@ -229,7 +268,9 @@ function poll(){
     if(d.auxHeat)bs+=badge('aux heat','on');
     if(d.defrost)bs+=badge('defrost','active');
     if(!d.displayOn)bs+=badge('display','off');
+    if(d.awayDry&&d.awayDry.on)bs+=badge('absent drying',d.awayDry.phase);
     document.getElementById('badges').innerHTML=bs;
+    adRender(d.awayDry);
     var kg='';
     if(t.amps!=null)kg+=krow('compressor current',fmt(t.amps,' A'));
     if(t.volts!=null)kg+=krow('inverter voltage (raw)',fmt(t.volts,' V'));

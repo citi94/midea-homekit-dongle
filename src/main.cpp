@@ -27,7 +27,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.5.0"
+#define FIRMWARE_VERSION "1.6.0"
 
 using namespace dudanov::midea::ac;
 
@@ -609,9 +609,13 @@ static uint32_t lastSampleMs = 0;
 
 // Event kinds; oldV/newV are the coded values (target is degC x10)
 enum EvtKind : uint8_t { EV_BOOT, EV_POWER, EV_MODE, EV_FAN, EV_PRESET,
-                         EV_TARGET, EV_DEFROST, EV_AUXHEAT, EV_ERR, EV_LINK };
+                         EV_TARGET, EV_DEFROST, EV_AUXHEAT, EV_ERR, EV_LINK,
+                         EV_AWAYDRY };
 static const char *EVT_NAMES[] = {"boot", "power", "mode", "fan", "preset",
-                                  "target", "defrost", "auxHeat", "err", "link"};
+                                  "target", "defrost", "auxHeat", "err", "link",
+                                  "awayDry"};
+// EV_AWAYDRY values
+static const char *AWAYDRY_NAMES[] = {"off", "heat", "cool", "yielded", "done"};
 struct __attribute__((packed)) LogEvent {
   uint32_t t;  // uptime seconds (wraps with millis() at 49.7 days)
   uint8_t kind;
@@ -749,6 +753,12 @@ static void jsonNum(String &j, float v) {
   }
 }
 
+static bool awayDryOn = false;
+static bool awayDryHeat = true;              // current phase
+static uint8_t awayDryHeatMin = 45, awayDryCoolMin = 30;
+static uint32_t awayDryPhaseMs = 0;          // phase start (millis)
+static uint32_t awayDryEndEpoch = 0;         // 0 = run until stopped
+
 static void handleApi() {
   const bool link = ac.getStatusAgeMs() < 15000;
   String j;
@@ -803,6 +813,16 @@ static void handleApi() {
     }
   }
   j += "},";
+  {
+    const uint32_t phaseLen = (awayDryHeat ? awayDryHeatMin : awayDryCoolMin) * 60000UL;
+    const uint32_t el = millis() - awayDryPhaseMs;
+    snprintf(b, sizeof(b),
+             "\"awayDry\":{\"on\":%d,\"phase\":\"%s\",\"left\":%lu,\"heatMin\":%u,\"coolMin\":%u,\"end\":%lu},",
+             awayDryOn, awayDryOn ? (awayDryHeat ? "heat" : "cool") : "off",
+             (unsigned long)((awayDryOn && el < phaseLen) ? (phaseLen - el) / 1000 : 0),
+             awayDryHeatMin, awayDryCoolMin, (unsigned long)awayDryEndEpoch);
+    j += b;
+  }
   snprintf(b, sizeof(b),
            "\"rssi\":%d,\"heap\":%u,\"uptime\":%lu,\"fw\":\"" FIRMWARE_VERSION "\","
            "\"logCount\":%d,\"evtCount\":%d,\"hist\":{\"dt\":%lu,",
@@ -905,6 +925,7 @@ static void handleEvents() {
       case EV_MODE: oldS = MODE_NAMES[e.oldV]; newS = MODE_NAMES[e.newV]; break;
       case EV_FAN: oldS = FAN_NAMES[e.oldV]; newS = FAN_NAMES[e.newV]; break;
       case EV_PRESET: oldS = PRESET_NAMES[e.oldV]; newS = PRESET_NAMES[e.newV]; break;
+      case EV_AWAYDRY: oldS = AWAYDRY_NAMES[e.oldV]; newS = AWAYDRY_NAMES[e.newV]; break;
       case EV_TARGET:
         snprintf(oldB, sizeof(oldB), "%.1f", e.oldV / 10.0f);
         snprintf(newB, sizeof(newB), "%.1f", e.newV / 10.0f);
@@ -1024,6 +1045,147 @@ static void handleCombo() {
             (unsigned)COMBO_STEP_MS + "ms — listen for the 2s buzzer\n");
 }
 
+// ---- Absent drying mode ---------------------------------------------------
+// For drying out a wet room while nobody is there. Alternates two phases:
+//   heat 30 C, medium fan  — warms the fabric of the room so it gives up its
+//                            water into the air (the air saturates within an
+//                            hour or so, which is why this can't run alone);
+//   cool 17 C, medium fan  — condenses that water out on a cold coil at the
+//                            top compressor grade, before it re-condenses on
+//                            the windows and outside walls.
+// A single long heat soak followed by dry mode does worse: dry mode is a
+// fixed 31 Hz on this unit (see FINDINGS.md), and a warm humid room for
+// hours is mould's favourite weather.
+//   /awaydry?on=1[&heat=45&cool=30][&first=cool]   start (minutes per phase;
+//                                     first phase defaults to heat)
+//     &end=<unix epoch>               at that time: set auto 20 C and stop
+//                                     ("done"), so the room is normal on arrival
+//   /awaydry?on=0                     stop (leaves the AC in its current state)
+// Persisted in NVS so a dongle reboot resumes rather than stranding the AC
+// in one phase. Yields (switches itself off, logs "yielded") if someone
+// changes mode or setpoint from the remote or HomeKit mid-phase.
+static uint32_t awayDryAssertMs = 0;
+static bool awayDryResume = false;  // set by awayDryLoad when NVS says "on"
+
+static void awayDrySave() {
+  Preferences p;
+  p.begin("dongle");
+  p.putBool("adOn", awayDryOn);
+  p.putUChar("adHeat", awayDryHeatMin);
+  p.putUChar("adCool", awayDryCoolMin);
+  p.putULong("adEnd", awayDryEndEpoch);
+  p.end();
+}
+
+static void awayDryLoad() {
+  Preferences p;
+  p.begin("dongle", true);
+  awayDryOn = p.getBool("adOn", false);
+  awayDryHeatMin = p.getUChar("adHeat", 45);
+  awayDryCoolMin = p.getUChar("adCool", 30);
+  awayDryEndEpoch = p.getULong("adEnd", 0);
+  p.end();
+  awayDryResume = awayDryOn;
+}
+
+static float awayDryTarget() { return awayDryHeat ? 30.0f : 17.0f; }
+static Mode awayDryMode() { return awayDryHeat ? Mode::MODE_HEAT : Mode::MODE_COOL; }
+
+static void awayDryAssert() {
+  Control c;
+  c.mode = awayDryMode();
+  c.targetTemp = awayDryTarget();
+  c.fanMode = FanMode::FAN_MEDIUM;
+  c.preset = Preset::PRESET_NONE;
+  sendAcControl(c);
+  awayDryAssertMs = millis();
+}
+
+static void awayDryStart(bool heatFirst) {
+  awayDryOn = true;
+  awayDryResume = false;
+  awayDryHeat = heatFirst;
+  awayDryPhaseMs = millis();
+  awayDryAssert();
+  logEvent(EV_AWAYDRY, 0, awayDryHeat ? 1 : 2);
+  WEBLOG("Absent drying: on, %s phase first (%u/%u min)",
+         awayDryHeat ? "heat" : "cool", awayDryHeatMin, awayDryCoolMin);
+}
+
+static void awayDryStop(bool yielded) {
+  if (!awayDryOn) return;
+  logEvent(EV_AWAYDRY, awayDryHeat ? 1 : 2, yielded ? 3 : 0);
+  awayDryOn = false;
+  awayDrySave();
+  WEBLOG("Absent drying: %s", yielded ? "yielded to manual change" : "off");
+}
+
+static void awayDryFinish() {
+  Control c;
+  c.mode = Mode::MODE_AUTO;
+  c.targetTemp = 20.0f;
+  c.preset = Preset::PRESET_NONE;
+  sendAcControl(c);
+  logEvent(EV_AWAYDRY, awayDryHeat ? 1 : 2, 4);
+  awayDryOn = false;
+  awayDryEndEpoch = 0;
+  awayDrySave();
+  WEBLOG("Absent drying: done, handed over to auto 20 C");
+}
+
+static void awayDryTick() {
+  if (!awayDryOn) return;
+  if (ac.getIndoorTemp() == 0.0f) return;  // AC hasn't spoken yet
+  if (awayDryResume) {                      // resumed from NVS after a reboot
+    awayDryStart(true);
+    return;
+  }
+  const time_t epoch = time(nullptr);
+  if (awayDryEndEpoch && epoch > 1600000000 && (uint32_t)epoch >= awayDryEndEpoch) {
+    awayDryFinish();
+    return;
+  }
+  const uint32_t now = millis();
+  const uint32_t phaseLen = (awayDryHeat ? awayDryHeatMin : awayDryCoolMin) * 60000UL;
+  if (now - awayDryPhaseMs >= phaseLen) {
+    const uint8_t from = awayDryHeat ? 1 : 2;
+    awayDryHeat = !awayDryHeat;
+    awayDryPhaseMs = now;
+    awayDryAssert();
+    logEvent(EV_AWAYDRY, from, awayDryHeat ? 1 : 2);
+    return;
+  }
+  // Yield to a human: once our command has settled, any later mode/setpoint
+  // change that isn't ours means someone is in the room with the remote.
+  if (mideaService->pendingValid) return;
+  if (now - awayDryAssertMs < 90000UL) return;
+  if (ac.getStatusAgeMs() > 15000) return;
+  const bool diverged = !ac.getPowerState() || ac.getMode() != awayDryMode() ||
+                        fabsf(ac.getTargetTemp() - awayDryTarget()) > 0.6f;
+  if (diverged) awayDryStop(true);
+}
+
+static void handleAwayDry() {
+  if (!dash.hasArg("on")) {
+    dash.send(400, "text/plain", "usage: /awaydry?on=1[&heat=45&cool=30][&first=cool] | /awaydry?on=0\n");
+    return;
+  }
+  if (dash.arg("on") == "1") {
+    if (dash.hasArg("heat")) awayDryHeatMin = constrain(dash.arg("heat").toInt(), 5, 180);
+    if (dash.hasArg("cool")) awayDryCoolMin = constrain(dash.arg("cool").toInt(), 5, 180);
+    awayDryEndEpoch = dash.hasArg("end") ? (uint32_t)strtoul(dash.arg("end").c_str(), nullptr, 10) : 0;
+    awayDryStart(dash.arg("first") != "cool");
+    awayDrySave();
+    dash.send(200, "text/plain",
+              String("absent drying on: heat 30/") + awayDryHeatMin +
+              "min <-> cool 17/" + awayDryCoolMin + "min, medium fan" +
+              (awayDryEndEpoch ? ", then auto 20 at end time" : "") + "\n");
+  } else {
+    awayDryStop(false);
+    dash.send(200, "text/plain", "absent drying off (AC left as is)\n");
+  }
+}
+
 void setup() {
   Serial.begin(115200);  // USB console: HomeSpan CLI + logs
 
@@ -1063,6 +1225,7 @@ void setup() {
   prefs.end();
   if (!hkWiped)
     homeSpan.processSerialCommand("H");  // erases pairing data, reboots
+  awayDryLoad();  // resumes an absent-drying run across reboots
 
   // Every function is its own bridged accessory: accessory-level names are
   // the only names this user's iOS reliably displays (service-level
@@ -1112,6 +1275,7 @@ void setup() {
   dash.on("/events", handleEvents);   // state transitions with timestamps
   dash.on("/probe", handleProbe);     // bus REPL: raw frame in, raw frame out
   dash.on("/combo", handleCombo);     // IR button combos via UART twins
+  dash.on("/awaydry", handleAwayDry); // heat/cool alternation for a wet room
   // Raw NVS partition dump: full identity backup (WiFi credentials + HomeKit
   // pairing keys). Restore to a spare board with:
   //   curl -o nvs.bin http://192.168.2.10:8080/nvsdump
@@ -1145,4 +1309,5 @@ void loop() {
   recorderTick();
   telemetryTick();
   comboTick();
+  awayDryTick();
 }

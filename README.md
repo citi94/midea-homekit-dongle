@@ -172,6 +172,27 @@ transition:
 
 This is the instrumentation behind [FINDINGS.md](FINDINGS.md).
 
+### Absent drying mode
+
+For drying out a wet room while nobody is in (the dashboard has a card for
+it; `curl` form below). It alternates *heat 30 °C* (warms the room's fabric
+so it releases water into the air) and *cool 17 °C* (condenses that water
+out on a cold coil at the top compressor grade), both on medium fan, and
+can hand over to *auto 20 °C* at a set time so the room is normal when you
+arrive. Dry mode alone does worse on this unit — it's a fixed 31 Hz and
+chills the room, see FINDINGS.md — and a long heat soak in a damp room is
+mould weather.
+
+```sh
+curl 'http://192.168.2.10:8080/awaydry?on=1&heat=60&cool=60&first=cool&end=1788937200'
+curl 'http://192.168.2.10:8080/awaydry?on=0'      # stop, AC left as is
+```
+
+Minutes per phase; `first` = `heat` (default) or `cool`; `end` = unix epoch.
+It survives a dongle reboot (NVS) and switches itself off if someone
+changes mode or setpoint from the remote or HomeKit mid-run (logged as
+`awayDry → yielded` in `/events`).
+
 ## Debugging
 
 - `http://192.168.2.10/status` — rolling HomeSpan web log: AC state changes,
