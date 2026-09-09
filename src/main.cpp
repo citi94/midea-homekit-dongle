@@ -1212,7 +1212,9 @@ static void handleAwayDry() {
 //   /guard?freeze=1&freezeC=5&overheat=1&overheatC=37&dew=1&dewMargin=2
 //         [&lat=..&lon=..][&wx=1 to refetch now]        (all persisted)
 //   /guard?stop=1     cancel a running protection (unit off, normal cooldown)
-//   /hum?rh=55        pushed indoor relative humidity (valid 2 h)
+//   /hum?rh=55[&t=18.2]   pushed indoor humidity from a remote sensor board,
+//                     with that board's own temperature if it has one (else
+//                     the AC's T1 is used); valid 2 h
 struct GuardCfg {
   bool freeze = true, overheat = true, dew = true;
   float freezeC = 5.0f, overheatC = 37.0f, dewMargin = 2.0f;
@@ -1232,7 +1234,7 @@ static float wxDewNow = NAN, wxDewMax = NAN, wxTempNow = NAN;
 static uint32_t wxFetchedMs = 0;             // 0 = never
 static char wxErr[48] = "not fetched yet";
 static uint32_t wxNextMs = 20000;            // first fetch shortly after boot
-static float humRh = NAN;                    // pushed indoor RH
+static float humRh = NAN, humT = NAN;        // pushed indoor RH (+ its own temp)
 static uint32_t humAtMs = 0;
 static uint8_t guardRun = 0;                 // GUARD_NAMES index, 0 = idle
 static uint32_t guardRunMs = 0, guardAssertMs = 0, guardCooldownUntil = 0;
@@ -1352,13 +1354,14 @@ static float dewPoint(float t, float rh) {  // Magnus
 
 static bool wxFresh() { return wxFetchedMs && millis() - wxFetchedMs < 3UL * 3600000UL; }
 static bool humFresh() { return humAtMs && millis() - humAtMs < 2UL * 3600000UL; }
+static float humDew() { return dewPoint(isnan(humT) ? ac.getIndoorTemp() : humT, humRh); }
 
 // Target the room must stay above so nothing sweats
 static float dewTarget() {
   float d = NAN;
   if (wxFresh() && !isnan(wxDewMax)) d = wxDewMax;
   if (humFresh()) {
-    const float id = dewPoint(ac.getIndoorTemp(), humRh);
+    const float id = humDew();
     if (!isnan(id) && (isnan(d) || id > d)) d = id;
   }
   return isnan(d) ? NAN : d + guard.dewMargin;
@@ -1488,7 +1491,8 @@ static void guardJson(String &j) {
            guard.lat, guard.lon);
   j += b;
   jsonNum(j, humFresh() ? humRh : NAN);
-  j += ",\"dew\":"; jsonNum(j, humFresh() ? dewPoint(ac.getIndoorTemp(), humRh) : NAN);
+  j += ",\"t\":"; jsonNum(j, humFresh() ? humT : NAN);
+  j += ",\"dew\":"; jsonNum(j, humFresh() ? humDew() : NAN);
   const int32_t cd = (int32_t)(guardCooldownUntil - millis());
   snprintf(b, sizeof(b),
            ",\"age\":%lu},\"run\":\"%s\",\"ran\":%lu,\"last\":\"%s\",\"lastAgo\":%lu,\"cooldown\":%ld},",
@@ -1528,10 +1532,11 @@ static void handleGuard() {
 static void handleHum() {
   if (!dash.hasArg("rh")) { dash.send(400, "text/plain", "usage: /hum?rh=55\n"); return; }
   humRh = argF("rh", NAN, 1, 100);
+  humT = dash.hasArg("t") ? argF("t", NAN, -30, 60) : NAN;
   humAtMs = millis();
   char b[96];
-  snprintf(b, sizeof(b), "indoor RH %.0f%% -> dew point %.1fC (T1 %.1fC)\n", humRh,
-           dewPoint(ac.getIndoorTemp(), humRh), ac.getIndoorTemp());
+  snprintf(b, sizeof(b), "indoor RH %.0f%% at %.1fC -> dew point %.1fC\n", humRh,
+           isnan(humT) ? ac.getIndoorTemp() : humT, humDew());
   dash.send(200, "text/plain", b);
 }
 
