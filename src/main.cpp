@@ -14,6 +14,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <time.h>
 #include "HomeSpan.h"
@@ -27,7 +28,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.6.0"
+#define FIRMWARE_VERSION "1.7.0"
 
 using namespace dudanov::midea::ac;
 
@@ -610,10 +611,12 @@ static uint32_t lastSampleMs = 0;
 // Event kinds; oldV/newV are the coded values (target is degC x10)
 enum EvtKind : uint8_t { EV_BOOT, EV_POWER, EV_MODE, EV_FAN, EV_PRESET,
                          EV_TARGET, EV_DEFROST, EV_AUXHEAT, EV_ERR, EV_LINK,
-                         EV_AWAYDRY };
+                         EV_AWAYDRY, EV_GUARD };
 static const char *EVT_NAMES[] = {"boot", "power", "mode", "fan", "preset",
                                   "target", "defrost", "auxHeat", "err", "link",
-                                  "awayDry"};
+                                  "awayDry", "guard"};
+// EV_GUARD values
+static const char *GUARD_NAMES[] = {"idle", "freeze", "overheat", "dew", "yielded"};
 // EV_AWAYDRY values
 static const char *AWAYDRY_NAMES[] = {"off", "heat", "cool", "yielded", "done"};
 struct __attribute__((packed)) LogEvent {
@@ -758,6 +761,7 @@ static bool awayDryHeat = true;              // current phase
 static uint8_t awayDryHeatMin = 45, awayDryCoolMin = 30;
 static uint32_t awayDryPhaseMs = 0;          // phase start (millis)
 static uint32_t awayDryEndEpoch = 0;         // 0 = run until stopped
+static void guardJson(String &j);            // defined with the guardian below
 
 static void handleApi() {
   const bool link = ac.getStatusAgeMs() < 15000;
@@ -823,6 +827,7 @@ static void handleApi() {
              awayDryHeatMin, awayDryCoolMin, (unsigned long)awayDryEndEpoch);
     j += b;
   }
+  guardJson(j);
   snprintf(b, sizeof(b),
            "\"rssi\":%d,\"heap\":%u,\"uptime\":%lu,\"fw\":\"" FIRMWARE_VERSION "\","
            "\"logCount\":%d,\"evtCount\":%d,\"hist\":{\"dt\":%lu,",
@@ -926,6 +931,7 @@ static void handleEvents() {
       case EV_FAN: oldS = FAN_NAMES[e.oldV]; newS = FAN_NAMES[e.newV]; break;
       case EV_PRESET: oldS = PRESET_NAMES[e.oldV]; newS = PRESET_NAMES[e.newV]; break;
       case EV_AWAYDRY: oldS = AWAYDRY_NAMES[e.oldV]; newS = AWAYDRY_NAMES[e.newV]; break;
+      case EV_GUARD: oldS = GUARD_NAMES[e.oldV]; newS = GUARD_NAMES[e.newV]; break;
       case EV_TARGET:
         snprintf(oldB, sizeof(oldB), "%.1f", e.oldV / 10.0f);
         snprintf(newB, sizeof(newB), "%.1f", e.newV / 10.0f);
@@ -1186,6 +1192,349 @@ static void handleAwayDry() {
   }
 }
 
+// ---- Guardian ---------------------------------------------------------------
+// Standing protections that run on the dongle itself, no HomeKit or phone
+// involved. Each only ever acts from standby (unit off, no absent-drying run,
+// no HomeKit command in flight), so it never fights a person, and each
+// releases the unit back to off when done.
+//   freeze    T1 below freezeC   -> heat 17 for an hour
+//   overheat  T1 above overheatC -> cool 25 for an hour
+//   dew       the rust one. After a cold snap the machines and slab sit at
+//             the old temperature; when a wet front arrives with a dew point
+//             above that, every surface sweats. The unit has no humidity
+//             sensor, so the dongle polls Open-Meteo hourly for the dew-point
+//             forecast at the workshop's coordinates and keeps the room above
+//             (highest dew point in the next 36 h + margin). The unit's lowest
+//             setpoint is 17, so the dongle is the thermostat: heat 17 while
+//             T1 is under target, off once it's a degree over, repeat.
+//             A measured indoor humidity pushed to /hum?rh=NN sharpens it
+//             (indoor dew point is then used as well as the forecast).
+//   /guard?freeze=1&freezeC=5&overheat=1&overheatC=37&dew=1&dewMargin=2
+//         [&lat=..&lon=..][&wx=1 to refetch now]        (all persisted)
+//   /guard?stop=1     cancel a running protection (unit off, normal cooldown)
+//   /hum?rh=55        pushed indoor relative humidity (valid 2 h)
+struct GuardCfg {
+  bool freeze = true, overheat = true, dew = true;
+  float freezeC = 5.0f, overheatC = 37.0f, dewMargin = 2.0f;
+  float lat = 51.228264f, lon = 1.388887f;
+};
+static GuardCfg guard;
+static constexpr uint32_t GUARD_RUN_MS = 60UL * 60000UL;       // freeze/overheat
+static constexpr uint32_t GUARD_DEW_MIN_MS = 20UL * 60000UL;   // shortest dew burst
+static constexpr uint32_t GUARD_COOLDOWN_MS = 30UL * 60000UL;
+static constexpr uint32_t GUARD_DEW_COOLDOWN_MS = 10UL * 60000UL;
+static constexpr uint32_t GUARD_YIELD_COOLDOWN_MS = 60UL * 60000UL;
+static constexpr float MASS_TAU_S = 36.0f * 3600.0f;           // fabric-temp EMA
+static constexpr int WX_LOOKAHEAD_H = 36;
+
+static float massTemp = NAN;                 // slow estimate of the room's fabric
+static float wxDewNow = NAN, wxDewMax = NAN, wxTempNow = NAN;
+static uint32_t wxFetchedMs = 0;             // 0 = never
+static char wxErr[48] = "not fetched yet";
+static uint32_t wxNextMs = 20000;            // first fetch shortly after boot
+static float humRh = NAN;                    // pushed indoor RH
+static uint32_t humAtMs = 0;
+static uint8_t guardRun = 0;                 // GUARD_NAMES index, 0 = idle
+static uint32_t guardRunMs = 0, guardAssertMs = 0, guardCooldownUntil = 0;
+static uint8_t guardLast = 0;                // last thing that fired
+static uint32_t guardLastMs = 0;
+static uint32_t acLastOnMs = 0, massSavedMs = 0;
+
+// -- weather fetch runs in its own task so a slow HTTP round-trip never stalls
+//    HomeSpan or the UART. It only writes the wxRes* block, and the main loop
+//    consumes it when wxReady flips.
+static volatile bool wxBusy = false, wxReady = false;
+static float wxResDewNow, wxResDewMax, wxResTemp;
+static bool wxResOk;
+static char wxResErr[48];
+
+static bool wxParse(const String &s) {
+  int c = s.indexOf("\"current\":{");
+  if (c < 0) return false;
+  int t = s.indexOf("\"temperature_2m\":", c);
+  int d = s.indexOf("\"dew_point_2m\":", c);
+  if (t < 0 || d < 0) return false;
+  wxResTemp = atof(s.c_str() + t + 17);
+  wxResDewNow = atof(s.c_str() + d + 15);
+  int h = s.indexOf("\"hourly\":{");
+  if (h < 0) return false;
+  int a = s.indexOf("\"dew_point_2m\":[", h);
+  if (a < 0) return false;
+  const time_t now = time(nullptr);
+  struct tm tmv;
+  gmtime_r(&now, &tmv);
+  const int idx = tmv.tm_hour;  // hourly[] starts at 00:00 UTC today
+  float mx = -100.0f;
+  int i = 0;
+  const char *p = s.c_str() + a + 16;
+  while (*p && *p != ']') {
+    if (*p == ',' || *p == ' ') { p++; continue; }
+    if (*p == 'n') {  // null
+      while (*p && *p != ',' && *p != ']') p++;
+      i++;
+      continue;
+    }
+    char *e;
+    const float v = strtof(p, &e);
+    if (e == p) break;
+    if (i >= idx && i < idx + WX_LOOKAHEAD_H && v > mx) mx = v;
+    i++;
+    p = e;
+  }
+  wxResDewMax = mx > -99.0f ? mx : NAN;
+  return true;
+}
+
+static void wxTask(void *) {
+  char url[260];
+  snprintf(url, sizeof(url),
+           "http://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f"
+           "&current=temperature_2m,dew_point_2m&hourly=dew_point_2m"
+           "&forecast_days=2&timezone=UTC",
+           guard.lat, guard.lon);
+  wxResOk = false;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (http.begin(client, url)) {
+    const int code = http.GET();
+    if (code == 200) {
+      String body = http.getString();
+      if (wxParse(body)) wxResOk = true;
+      else snprintf(wxResErr, sizeof(wxResErr), "parse failed (%u bytes)", body.length());
+    } else {
+      snprintf(wxResErr, sizeof(wxResErr), "http %d", code);
+    }
+    http.end();
+  } else {
+    snprintf(wxResErr, sizeof(wxResErr), "connect failed");
+  }
+  wxReady = true;
+  wxBusy = false;
+  vTaskDelete(nullptr);
+}
+
+static void wxKick() {
+  if (wxBusy || WiFi.status() != WL_CONNECTED) return;
+  wxBusy = true;
+  wxReady = false;
+  xTaskCreate(wxTask, "wx", 8192, nullptr, 1, nullptr);
+}
+
+static void wxTick() {
+  if (wxReady) {
+    wxReady = false;
+    if (wxResOk) {
+      wxDewNow = wxResDewNow; wxDewMax = wxResDewMax; wxTempNow = wxResTemp;
+      wxFetchedMs = millis();
+      wxErr[0] = 0;
+      wxNextMs = millis() + 60UL * 60000UL;
+      WEBLOG("Weather: outdoor %.1fC dew %.1fC, max dew next %dh %.1fC",
+             wxTempNow, wxDewNow, WX_LOOKAHEAD_H, wxDewMax);
+    } else {
+      strlcpy(wxErr, wxResErr, sizeof(wxErr));
+      wxNextMs = millis() + 5UL * 60000UL;
+      WEBLOG("Weather fetch failed: %s", wxErr);
+    }
+  }
+  if ((int32_t)(millis() - wxNextMs) >= 0 && !wxBusy) {
+    wxNextMs = millis() + 2UL * 60000UL;  // in case the task never reports
+    wxKick();
+  }
+}
+
+static float dewPoint(float t, float rh) {  // Magnus
+  if (isnan(t) || isnan(rh) || rh <= 0) return NAN;
+  const float a = 17.62f, b = 243.12f;
+  const float g = logf(rh / 100.0f) + a * t / (b + t);
+  return b * g / (a - g);
+}
+
+static bool wxFresh() { return wxFetchedMs && millis() - wxFetchedMs < 3UL * 3600000UL; }
+static bool humFresh() { return humAtMs && millis() - humAtMs < 2UL * 3600000UL; }
+
+// Target the room must stay above so nothing sweats
+static float dewTarget() {
+  float d = NAN;
+  if (wxFresh() && !isnan(wxDewMax)) d = wxDewMax;
+  if (humFresh()) {
+    const float id = dewPoint(ac.getIndoorTemp(), humRh);
+    if (!isnan(id) && (isnan(d) || id > d)) d = id;
+  }
+  return isnan(d) ? NAN : d + guard.dewMargin;
+}
+
+static void guardSave() {
+  Preferences p;
+  p.begin("dongle");
+  p.putBool("gFr", guard.freeze);   p.putFloat("gFrC", guard.freezeC);
+  p.putBool("gOv", guard.overheat); p.putFloat("gOvC", guard.overheatC);
+  p.putBool("gDw", guard.dew);      p.putFloat("gDwM", guard.dewMargin);
+  p.putFloat("gLat", guard.lat);    p.putFloat("gLon", guard.lon);
+  p.end();
+}
+
+static void guardLoad() {
+  Preferences p;
+  p.begin("dongle", true);
+  guard.freeze = p.getBool("gFr", true);     guard.freezeC = p.getFloat("gFrC", 5.0f);
+  guard.overheat = p.getBool("gOv", true);   guard.overheatC = p.getFloat("gOvC", 37.0f);
+  guard.dew = p.getBool("gDw", true);        guard.dewMargin = p.getFloat("gDwM", 2.0f);
+  guard.lat = p.getFloat("gLat", 51.228264f); guard.lon = p.getFloat("gLon", 1.388887f);
+  massTemp = p.getFloat("massT", NAN);
+  p.end();
+}
+
+static void guardStart(uint8_t what) {
+  Control c;
+  c.mode = (what == 2) ? Mode::MODE_COOL : Mode::MODE_HEAT;
+  c.targetTemp = (what == 2) ? 25.0f : 17.0f;
+  c.fanMode = FanMode::FAN_AUTO;
+  c.preset = Preset::PRESET_NONE;
+  sendAcControl(c);
+  guardRun = what;
+  guardRunMs = guardAssertMs = millis();
+  guardLast = what;
+  guardLastMs = millis();
+  logEvent(EV_GUARD, 0, what);
+  WEBLOG("Guardian: %s protection on (T1 %.1fC)", GUARD_NAMES[what], ac.getIndoorTemp());
+}
+
+static void guardStop(bool yielded) {
+  if (!guardRun) return;
+  const uint8_t was = guardRun;
+  if (!yielded) {
+    Control c;
+    c.mode = Mode::MODE_OFF;
+    sendAcControl(c);
+  }
+  logEvent(EV_GUARD, was, yielded ? 4 : 0);
+  WEBLOG("Guardian: %s protection %s", GUARD_NAMES[was],
+         yielded ? "yielded to a manual change" : "done, unit off");
+  guardRun = 0;
+  guardCooldownUntil = millis() + (yielded ? GUARD_YIELD_COOLDOWN_MS
+                                   : was == 3 ? GUARD_DEW_COOLDOWN_MS
+                                              : GUARD_COOLDOWN_MS);
+}
+
+static void guardTick() {
+  static uint32_t lastMs = 0;
+  wxTick();
+  const uint32_t now = millis();
+  if (now - lastMs < 5000) return;
+  lastMs = now;
+  const float t1 = ac.getIndoorTemp();
+  const bool link = ac.getStatusAgeMs() < 15000;
+  if (!link || t1 == 0.0f) return;
+  const bool power = ac.getPowerState();
+  if (power) acLastOnMs = now;
+
+  // Fabric-temperature estimate: T1 sampled only after the unit has been off
+  // for 10 min (while running, the intake sensor reads the unit's own air).
+  if (!power && now - acLastOnMs > 10UL * 60000UL) {
+    if (isnan(massTemp)) massTemp = t1;
+    else massTemp += (t1 - massTemp) * (5.0f / MASS_TAU_S);
+    if (now - massSavedMs > 3600000UL) {
+      massSavedMs = now;
+      Preferences p; p.begin("dongle"); p.putFloat("massT", massTemp); p.end();
+    }
+  }
+
+  if (guardRun) {
+    const uint32_t ran = now - guardRunMs;
+    if (!mideaService->pendingValid && now - guardAssertMs > 90000UL) {
+      const Mode want = (guardRun == 2) ? Mode::MODE_COOL : Mode::MODE_HEAT;
+      const float wantT = (guardRun == 2) ? 25.0f : 17.0f;
+      if (!power || ac.getMode() != want || fabsf(ac.getTargetTemp() - wantT) > 0.6f) {
+        guardStop(true);
+        return;
+      }
+    }
+    bool done = ran >= GUARD_RUN_MS;
+    if (guardRun == 3 && ran >= GUARD_DEW_MIN_MS) {
+      const float tgt = dewTarget();
+      if (isnan(tgt) || t1 >= tgt + 1.0f) done = true;
+    }
+    if (done) guardStop(false);
+    return;
+  }
+
+  if ((int32_t)(now - guardCooldownUntil) < 0) return;
+  const bool standby = !power && !awayDryOn && !mideaService->pendingValid;
+  if (!standby) return;
+  if (guard.freeze && t1 < guard.freezeC) { guardStart(1); return; }
+  if (guard.overheat && t1 > guard.overheatC) { guardStart(2); return; }
+  if (guard.dew) {
+    const float tgt = dewTarget();
+    if (!isnan(tgt) && t1 < tgt - 0.5f) guardStart(3);
+  }
+}
+
+static void guardJson(String &j) {
+  char b[200];
+  snprintf(b, sizeof(b),
+           "\"guard\":{\"freeze\":{\"on\":%d,\"c\":%.1f},\"overheat\":{\"on\":%d,\"c\":%.1f},"
+           "\"dew\":{\"on\":%d,\"margin\":%.1f,\"target\":",
+           guard.freeze, guard.freezeC, guard.overheat, guard.overheatC,
+           guard.dew, guard.dewMargin);
+  j += b;
+  jsonNum(j, dewTarget());
+  j += "},\"mass\":"; jsonNum(j, massTemp);
+  j += ",\"wx\":{\"dewNow\":"; jsonNum(j, wxFresh() ? wxDewNow : NAN);
+  j += ",\"dewMax\":"; jsonNum(j, wxFresh() ? wxDewMax : NAN);
+  j += ",\"temp\":"; jsonNum(j, wxFresh() ? wxTempNow : NAN);
+  snprintf(b, sizeof(b), ",\"age\":%lu,\"err\":\"%s\",\"lat\":%.5f,\"lon\":%.5f},\"hum\":{\"rh\":",
+           (unsigned long)(wxFetchedMs ? (millis() - wxFetchedMs) / 1000 : 0), wxErr,
+           guard.lat, guard.lon);
+  j += b;
+  jsonNum(j, humFresh() ? humRh : NAN);
+  j += ",\"dew\":"; jsonNum(j, humFresh() ? dewPoint(ac.getIndoorTemp(), humRh) : NAN);
+  const int32_t cd = (int32_t)(guardCooldownUntil - millis());
+  snprintf(b, sizeof(b),
+           ",\"age\":%lu},\"run\":\"%s\",\"ran\":%lu,\"last\":\"%s\",\"lastAgo\":%lu,\"cooldown\":%ld},",
+           (unsigned long)(humAtMs ? (millis() - humAtMs) / 1000 : 0), GUARD_NAMES[guardRun],
+           (unsigned long)(guardRun ? (millis() - guardRunMs) / 1000 : 0),
+           GUARD_NAMES[guardLast], (unsigned long)(guardLastMs ? (millis() - guardLastMs) / 1000 : 0),
+           (long)(cd > 0 ? cd / 1000 : 0));
+  j += b;
+}
+
+static float argF(const char *k, float cur, float lo, float hi) {
+  if (!dash.hasArg(k)) return cur;
+  const float v = dash.arg(k).toFloat();
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+static void handleGuard() {
+  if (dash.arg("stop") == "1") guardStop(false);
+  if (dash.hasArg("freeze")) guard.freeze = dash.arg("freeze") == "1";
+  if (dash.hasArg("overheat")) guard.overheat = dash.arg("overheat") == "1";
+  if (dash.hasArg("dew")) guard.dew = dash.arg("dew") == "1";
+  guard.freezeC = argF("freezeC", guard.freezeC, -5, 15);
+  guard.overheatC = argF("overheatC", guard.overheatC, 25, 45);
+  guard.dewMargin = argF("dewMargin", guard.dewMargin, 0, 6);
+  const float lat = argF("lat", guard.lat, -90, 90), lon = argF("lon", guard.lon, -180, 180);
+  const bool moved = lat != guard.lat || lon != guard.lon;
+  guard.lat = lat; guard.lon = lon;
+  guardSave();
+  if (moved || dash.arg("wx") == "1") wxNextMs = millis();  // fetch on next tick
+  String j = "{";
+  guardJson(j);
+  j.remove(j.length() - 1);  // trailing comma
+  j += "}";
+  dash.send(200, "application/json", j);
+}
+
+static void handleHum() {
+  if (!dash.hasArg("rh")) { dash.send(400, "text/plain", "usage: /hum?rh=55\n"); return; }
+  humRh = argF("rh", NAN, 1, 100);
+  humAtMs = millis();
+  char b[96];
+  snprintf(b, sizeof(b), "indoor RH %.0f%% -> dew point %.1fC (T1 %.1fC)\n", humRh,
+           dewPoint(ac.getIndoorTemp(), humRh), ac.getIndoorTemp());
+  dash.send(200, "text/plain", b);
+}
+
 void setup() {
   Serial.begin(115200);  // USB console: HomeSpan CLI + logs
 
@@ -1226,6 +1575,7 @@ void setup() {
   if (!hkWiped)
     homeSpan.processSerialCommand("H");  // erases pairing data, reboots
   awayDryLoad();  // resumes an absent-drying run across reboots
+  guardLoad();    // freeze / overheat / dew protections
 
   // Every function is its own bridged accessory: accessory-level names are
   // the only names this user's iOS reliably displays (service-level
@@ -1276,6 +1626,8 @@ void setup() {
   dash.on("/probe", handleProbe);     // bus REPL: raw frame in, raw frame out
   dash.on("/combo", handleCombo);     // IR button combos via UART twins
   dash.on("/awaydry", handleAwayDry); // heat/cool alternation for a wet room
+  dash.on("/guard", handleGuard);     // standing protections config/status
+  dash.on("/hum", handleHum);         // push a measured indoor humidity
   // Raw NVS partition dump: full identity backup (WiFi credentials + HomeKit
   // pairing keys). Restore to a spare board with:
   //   curl -o nvs.bin http://192.168.2.10:8080/nvsdump
@@ -1310,4 +1662,5 @@ void loop() {
   telemetryTick();
   comboTick();
   awayDryTick();
+  guardTick();
 }

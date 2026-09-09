@@ -193,6 +193,33 @@ It survives a dongle reboot (NVS) and switches itself off if someone
 changes mode or setpoint from the remote or HomeKit mid-run (logged as
 `awayDry → yielded` in `/events`).
 
+### Guardian (standing protections)
+
+Three rules that run on the dongle itself, independent of HomeKit. They
+only act when the unit is in standby (off, no absent-drying run, no
+HomeKit command in flight), so they never fight a person, and they release
+the unit back to off when done. Dashboard card with toggles and thresholds;
+every firing is logged in `/events` as `guard`.
+
+- **Freeze**: indoor below 5 °C → heat 17 °C for an hour.
+- **Overheat**: indoor above 37 °C → cool 25 °C for an hour.
+- **Dew** (the rust one): after a cold snap the machines and floor sit at
+  the old temperature; when a wet front arrives with a dew point above that,
+  every surface sweats. The unit has no humidity sensor, so the dongle polls
+  [Open-Meteo](https://open-meteo.com/) hourly (plain HTTP, no key) for the
+  dew-point forecast at the workshop's coordinates and keeps the room above
+  *highest dew point in the next 36 h + margin*. The unit's lowest setpoint
+  is 17, so the dongle acts as the thermostat: heat 17 while the room is
+  under target, off once it's a degree over, repeat. A measured indoor
+  humidity can be pushed to sharpen it (indoor dew point is then used too).
+
+```sh
+curl 'http://192.168.2.10:8080/guard'                         # status JSON
+curl 'http://192.168.2.10:8080/guard?dew=1&dewMargin=2&lat=51.23&lon=1.39'
+curl 'http://192.168.2.10:8080/guard?stop=1'                  # cancel a run
+curl 'http://192.168.2.10:8080/hum?rh=55'                     # push indoor RH
+```
+
 ## Debugging
 
 - `http://192.168.2.10/status` — rolling HomeSpan web log: AC state changes,

@@ -119,6 +119,18 @@ canvas{width:100%;height:220px;display:block}
   </div>
 </div>
 
+<div class="card"><h2>Guardian</h2>
+  <div class="ad" id="gd">
+    <span><label><input type="checkbox" id="gFr"> freeze</label> below <input id="gFrC" type="number" step="0.5">° → heat 17° for 1 h</span>
+    <span><label><input type="checkbox" id="gOv"> overheat</label> above <input id="gOvC" type="number" step="0.5">° → cool 25° for 1 h</span>
+    <span><label><input type="checkbox" id="gDw"> dew</label> keep room above forecast dew point + <input id="gDwM" type="number" step="0.5">°</span>
+    <button class="btn" onclick="gSave()">Save</button>
+    <button class="btn" id="gStop" onclick="fetch('/guard?stop=1').then(poll)" hidden>Stop protection</button>
+    <span class="st" id="gSt">–</span>
+  </div>
+  <div class="kgrid" id="ggrid"></div>
+</div>
+
 <div class="card"><h2>System</h2><div class="sys" id="sys"></div></div>
 
 <script>
@@ -240,6 +252,34 @@ function adRender(a){
     (a.end?', auto 20° at '+hm(new Date(a.end*1000)):''):
     'alternates heat and cool to dry out a wet room while nobody is in';
 }
+function gSave(){
+  var v=function(id){return document.getElementById(id).value};
+  var c=function(id){return document.getElementById(id).checked?1:0};
+  fetch('/guard?freeze='+c('gFr')+'&freezeC='+v('gFrC')+'&overheat='+c('gOv')+'&overheatC='+v('gOvC')+
+    '&dew='+c('gDw')+'&dewMargin='+v('gDwM')).then(function(){poll()});
+}
+function ago(s){return s<90?s+' s':s<5400?Math.round(s/60)+' min':Math.round(s/360)/10+' h'}
+function gRender(g){
+  if(!g)return;
+  var set=function(id,val,chk){var e=document.getElementById(id);if(document.activeElement===e)return;
+    if(chk)e.checked=!!val;else e.value=val};
+  set('gFr',g.freeze.on,1);set('gFrC',g.freeze.c);set('gOv',g.overheat.on,1);set('gOvC',g.overheat.c);
+  set('gDw',g.dew.on,1);set('gDwM',g.dew.margin);
+  var st=g.run!=='idle'?g.run+' protection running, '+ago(g.ran)+' in':
+    (g.cooldown?'idle, cooldown '+ago(g.cooldown):'idle');
+  if(g.last!=='idle')st+=' · last fired: '+g.last+' '+ago(g.lastAgo)+' ago';
+  document.getElementById('gSt').textContent=st;
+  document.getElementById('gStop').hidden=g.run==='idle';
+  var k='';
+  k+=krow('room fabric estimate',fmt(g.mass));
+  k+=krow('dew target (stay above)',fmt(g.dew.target));
+  k+=krow('forecast dew point now',fmt(g.wx.dewNow));
+  k+=krow('max dew point next 36 h',fmt(g.wx.dewMax));
+  k+=krow('outdoor (forecast)',fmt(g.wx.temp));
+  k+=krow('weather fetched',g.wx.err?('error: '+g.wx.err):ago(g.wx.age)+' ago');
+  if(g.hum.rh!=null)k+=krow('indoor humidity (pushed)',fmt(g.hum.rh,'%')+' → dew '+fmt(g.hum.dew));
+  document.getElementById('ggrid').innerHTML=k;
+}
 function poll(){
   fetch('/api').then(function(r){return r.json()}).then(function(d){
     D=d;
@@ -269,8 +309,10 @@ function poll(){
     if(d.defrost)bs+=badge('defrost','active');
     if(!d.displayOn)bs+=badge('display','off');
     if(d.awayDry&&d.awayDry.on)bs+=badge('absent drying',d.awayDry.phase);
+    if(d.guard&&d.guard.run!=='idle')bs+=badge('guardian',d.guard.run);
     document.getElementById('badges').innerHTML=bs;
     adRender(d.awayDry);
+    gRender(d.guard);
     var kg='';
     if(t.amps!=null)kg+=krow('compressor current',fmt(t.amps,' A'));
     if(t.volts!=null)kg+=krow('inverter voltage (raw)',fmt(t.volts,' V'));
