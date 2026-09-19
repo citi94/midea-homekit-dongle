@@ -331,7 +331,8 @@ function poll(){
     document.getElementById('hzCard').style.display=hzData?'':'none';
     document.getElementById('sys').innerHTML=
       '<span>wifi <b>'+d.rssi+' dBm</b></span><span>heap <b>'+
-      Math.round(d.heap/1024)+' kB</b></span><span>up <b>'+upt(d.uptime)+
+      Math.round(d.heap/1024)+' kB</b></span><span>sockets <b>'+(d.hapSockets==null?'–':d.hapSockets+'/16')+
+      '</b></span><span>up <b>'+upt(d.uptime)+
       '</b></span><span>fw <b>'+d.fw+'</b></span><span>telemetry <b>g1:'+
       (d.groups.g1?'✓':'–')+' g2:'+(d.groups.g2?'✓':'–')+
       ' g5:'+(d.groups.g5?'✓':'–')+' g7:'+(d.groups.g7?'✓':'–')+

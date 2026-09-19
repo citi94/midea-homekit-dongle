@@ -15,6 +15,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
+#include <lwip/sockets.h>
 #include <WebServer.h>
 #include <time.h>
 #include "HomeSpan.h"
@@ -28,7 +29,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.7.0"
+#define FIRMWARE_VERSION "1.7.1"
 
 using namespace dudanov::midea::ac;
 
@@ -762,6 +763,7 @@ static uint8_t awayDryHeatMin = 45, awayDryCoolMin = 30;
 static uint32_t awayDryPhaseMs = 0;          // phase start (millis)
 static uint32_t awayDryEndEpoch = 0;         // 0 = run until stopped
 static void guardJson(String &j);            // defined with the guardian below
+static int hapSockets = 0;                   // LWIP sockets in use (of 16)
 
 static void handleApi() {
   const bool link = ac.getStatusAgeMs() < 15000;
@@ -829,9 +831,9 @@ static void handleApi() {
   }
   guardJson(j);
   snprintf(b, sizeof(b),
-           "\"rssi\":%d,\"heap\":%u,\"uptime\":%lu,\"fw\":\"" FIRMWARE_VERSION "\","
+           "\"rssi\":%d,\"heap\":%u,\"hapSockets\":%d,\"uptime\":%lu,\"fw\":\"" FIRMWARE_VERSION "\","
            "\"logCount\":%d,\"evtCount\":%d,\"hist\":{\"dt\":%lu,",
-           WiFi.RSSI(), (unsigned)ESP.getFreeHeap(),
+           WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), hapSockets,
            (unsigned long)(millis() / 1000), logCount, evtCount,
            (unsigned long)(LOG_PERIOD_MS / 1000));
   j += b;
@@ -1540,6 +1542,44 @@ static void handleHum() {
   dash.send(200, "text/plain", b);
 }
 
+// ---- Socket hygiene ---------------------------------------------------------
+// LWIP is built with 16 sockets. HomeSpan 2.x accepts every HomeKit
+// controller into an unbounded list and only drops one when the socket
+// reports itself closed, and neither it nor the Arduino core turns on TCP
+// keepalive. A phone that walks out of WiFi range never sends a FIN, so its
+// socket stays "connected" forever. Ghosts accumulate over days until
+// accept() has no socket left, at which point every new connection (the
+// dashboard, the weblog, OTA) is reset within milliseconds while the
+// already-open HomeKit connections carry on working.
+// LWIP's sockets are a fixed table of descriptors, so once a second walk the
+// whole table, count what's live, and put keepalive with short timers on
+// every socket: LWIP then proves each peer is alive and tears the dead ones
+// down in about a minute, and HomeSpan sees them close.
+static void socketHygieneTick() {
+  static uint32_t lastMs = 0;
+  static int lastCount = -1;
+  if (millis() - lastMs < 1000) return;
+  lastMs = millis();
+  int n = 0;
+  for (int fd = LWIP_SOCKET_OFFSET; fd < LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS; fd++) {
+    int type = 0;
+    socklen_t len = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) continue;  // slot free
+    n++;
+    if (type != SOCK_STREAM) continue;
+    int en = 1, idle = 30, intv = 10, cnt = 3;  // dead after 30 + 3*10 s
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &en, sizeof(en));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intv, sizeof(intv));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+  }
+  hapSockets = n;
+  if (n != lastCount) {
+    if (n >= 12) WEBLOG("Sockets: %d of %d in use", n, CONFIG_LWIP_MAX_SOCKETS);
+    lastCount = n;
+  }
+}
+
 void setup() {
   Serial.begin(115200);  // USB console: HomeSpan CLI + logs
 
@@ -1567,6 +1607,11 @@ void setup() {
   // assigned to its own room ("Outside") in the Home app, independent of
   // the climate accessory.
   homeSpan.begin(Category::Bridges, "Mini-Split");
+  // Modem sleep parks the radio between DTIM beacons: every inbound
+  // connection waits for the next wake, ping sits at 60-100 ms, and the OTA
+  // burst often dies in its first second. The board is mains-powered from
+  // the AC's 5 V, so spend the ~80 mA and keep the radio up.
+  WiFi.setSleep(false);
 
   // One-shot pairing wipe, keyed per structural change (accessory layout
   // changes alter the HomeKit identity/database, so force a clean unpair on
@@ -1668,4 +1713,5 @@ void loop() {
   comboTick();
   awayDryTick();
   guardTick();
+  socketHygieneTick();
 }
