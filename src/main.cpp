@@ -16,6 +16,7 @@
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include <lwip/sockets.h>
+#include <esp_system.h>
 #include <WebServer.h>
 #include <time.h>
 #include "HomeSpan.h"
@@ -29,7 +30,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.7.1"
+#define FIRMWARE_VERSION "1.7.2"
 
 using namespace dudanov::midea::ac;
 
@@ -700,7 +701,7 @@ static void recorderTick() {
     if (ac.getIndoorTemp() == 0.0f)  // no status from the AC yet
       return;
     started = true;
-    logEvent(EV_BOOT, 0, 0);
+    logEvent(EV_BOOT, 0, (int16_t)esp_reset_reason());
     pPower = ac.getPowerState(); pMode = modeCode(ac.getMode());
     pFan = fanCode(ac.getFanMode()); pPreset = presetCode(ac.getPreset());
     pTarget = packTemp(ac.getTargetTemp()); pDefrost = ac.tele.defrost;
@@ -764,6 +765,24 @@ static uint32_t awayDryPhaseMs = 0;          // phase start (millis)
 static uint32_t awayDryEndEpoch = 0;         // 0 = run until stopped
 static void guardJson(String &j);            // defined with the guardian below
 static int hapSockets = 0;                   // LWIP sockets in use (of 16)
+// Why we booted, kept across reboots in NVS so a crash or brownout that
+// wipes the RAM rings still leaves a trace: last 8 reasons, newest first.
+static const char *resetName(int r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int-wdt";
+    case ESP_RST_TASK_WDT: return "task-wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
+static uint8_t bootReasons[8];
+static uint32_t bootCount = 0;
 
 static void handleApi() {
   const bool link = ac.getStatusAgeMs() < 15000;
@@ -830,10 +849,17 @@ static void handleApi() {
     j += b;
   }
   guardJson(j);
+  snprintf(b, sizeof(b), "\"boots\":%lu,\"bootReasons\":[", (unsigned long)bootCount);
+  j += b;
+  for (int i = 0; i < 8 && i < (int)bootCount; i++) {
+    if (i) j += ',';
+    j += '"'; j += resetName(bootReasons[i]); j += '"';
+  }
+  j += "],";
   snprintf(b, sizeof(b),
-           "\"rssi\":%d,\"heap\":%u,\"hapSockets\":%d,\"uptime\":%lu,\"fw\":\"" FIRMWARE_VERSION "\","
+           "\"rssi\":%d,\"heap\":%u,\"heapMin\":%u,\"hapSockets\":%d,\"uptime\":%lu,\"fw\":\"" FIRMWARE_VERSION "\","
            "\"logCount\":%d,\"evtCount\":%d,\"hist\":{\"dt\":%lu,",
-           WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), hapSockets,
+           WiFi.RSSI(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), hapSockets,
            (unsigned long)(millis() / 1000), logCount, evtCount,
            (unsigned long)(LOG_PERIOD_MS / 1000));
   j += b;
@@ -1625,6 +1651,18 @@ void setup() {
   if (!hkWiped)
     homeSpan.processSerialCommand("H");  // erases pairing data, reboots
   awayDryLoad();  // resumes an absent-drying run across reboots
+  {
+    Preferences p;
+    p.begin("dongle");
+    bootCount = p.getULong("boots", 0) + 1;
+    p.getBytes("bootWhy", bootReasons, sizeof(bootReasons));
+    memmove(bootReasons + 1, bootReasons, sizeof(bootReasons) - 1);
+    bootReasons[0] = (uint8_t)esp_reset_reason();
+    p.putULong("boots", bootCount);
+    p.putBytes("bootWhy", bootReasons, sizeof(bootReasons));
+    p.end();
+    WEBLOG("Boot #%lu, reason: %s", (unsigned long)bootCount, resetName(bootReasons[0]));
+  }
   guardLoad();    // freeze / overheat / dew protections
 
   // Every function is its own bridged accessory: accessory-level names are
