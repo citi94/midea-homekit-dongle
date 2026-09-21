@@ -30,7 +30,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.7.2"
+#define FIRMWARE_VERSION "1.7.3"
 
 using namespace dudanov::midea::ac;
 
@@ -783,6 +783,16 @@ static const char *resetName(int r) {
 }
 static uint8_t bootReasons[8];
 static uint32_t bootCount = 0;
+// Breadcrumb: which section of loop() we were in, kept in RTC memory so it
+// survives a panic/watchdog reset and can be reported at the next boot.
+enum Crumb : uint8_t { CR_NONE, CR_HOMESPAN, CR_AC, CR_DASH, CR_RECORDER, CR_TELEMETRY,
+                       CR_COMBO, CR_AWAYDRY, CR_GUARD, CR_SOCKETS, CR_PROBE, CR_WX };
+static const char *CRUMB_NAMES[] = {"none", "homespan", "ac", "dash", "recorder", "telemetry",
+                                    "combo", "awaydry", "guard", "sockets", "probe", "wx"};
+RTC_NOINIT_ATTR static uint32_t crumbMagic;
+RTC_NOINIT_ATTR static uint8_t crumb;
+RTC_NOINIT_ATTR static uint8_t crumbHist[8];  // crumb at each of the last 8 boots
+static inline void setCrumb(uint8_t c) { crumb = c; }
 
 static void handleApi() {
   const bool link = ac.getStatusAgeMs() < 15000;
@@ -853,7 +863,9 @@ static void handleApi() {
   j += b;
   for (int i = 0; i < 8 && i < (int)bootCount; i++) {
     if (i) j += ',';
-    j += '"'; j += resetName(bootReasons[i]); j += '"';
+    j += '"'; j += resetName(bootReasons[i]);
+    if (crumbHist[i]) { j += " in "; j += CRUMB_NAMES[crumbHist[i] < 12 ? crumbHist[i] : 0]; }
+    j += '"';
   }
   j += "],";
   snprintf(b, sizeof(b),
@@ -1000,6 +1012,7 @@ static void mideaLogger(int level, const char *tag, int line, String format, va_
 // sending). Hex may contain spaces. Prospecting tool for unmapped protocol
 // space; the flight recorder catches any behavioral side effects.
 static void handleProbe() {
+  setCrumb(CR_PROBE);
   const String hex = dash.arg("hex");
   const uint8_t type = strtol(dash.arg("type").c_str(), nullptr, 16);
   uint8_t body[48];
@@ -1315,7 +1328,12 @@ static bool wxParse(const String &s) {
   return true;
 }
 
-static void wxTask(void *) {
+// The fetch lives in its own function so every local (the client, its
+// socket) is destroyed on return, *before* vTaskDelete. vTaskDelete never
+// returns, so anything still in scope at that point is never destructed:
+// v1.7.0-1.7.2 leaked one socket per hourly fetch this way and ran the
+// 16-socket table dry in about half a day.
+static void wxFetch() {
   char url[260];
   snprintf(url, sizeof(url),
            "http://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f"
@@ -1326,6 +1344,7 @@ static void wxTask(void *) {
   WiFiClient client;
   HTTPClient http;
   http.setTimeout(8000);
+  http.setReuse(false);  // always close after the exchange
   if (http.begin(client, url)) {
     const int code = http.GET();
     if (code == 200) {
@@ -1339,6 +1358,12 @@ static void wxTask(void *) {
   } else {
     snprintf(wxResErr, sizeof(wxResErr), "connect failed");
   }
+  client.stop();
+}
+
+static void wxTask(void *) {
+  setCrumb(CR_WX);
+  wxFetch();
   wxReady = true;
   wxBusy = false;
   vTaskDelete(nullptr);
@@ -1348,7 +1373,7 @@ static void wxKick() {
   if (wxBusy || WiFi.status() != WL_CONNECTED) return;
   wxBusy = true;
   wxReady = false;
-  xTaskCreate(wxTask, "wx", 8192, nullptr, 1, nullptr);
+  xTaskCreate(wxTask, "wx", 10240, nullptr, 1, nullptr);
 }
 
 static void wxTick() {
@@ -1584,7 +1609,8 @@ static void handleHum() {
 static void socketHygieneTick() {
   static uint32_t lastMs = 0;
   static int lastCount = -1;
-  if (millis() - lastMs < 1000) return;
+  if (millis() - lastMs < 10000) return;
+  if (wxBusy) return;  // the weather task is the only other socket user; never race it
   lastMs = millis();
   int n = 0;
   for (int fd = LWIP_SOCKET_OFFSET; fd < LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS; fd++) {
@@ -1661,7 +1687,14 @@ void setup() {
     p.putULong("boots", bootCount);
     p.putBytes("bootWhy", bootReasons, sizeof(bootReasons));
     p.end();
-    WEBLOG("Boot #%lu, reason: %s", (unsigned long)bootCount, resetName(bootReasons[0]));
+    const uint8_t r = bootReasons[0];
+    const bool crashed = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+    if (crumbMagic != 0xC12B5EEDUL) { crumbMagic = 0xC12B5EEDUL; crumb = 0; memset(crumbHist, 0, sizeof(crumbHist)); }
+    memmove(crumbHist + 1, crumbHist, sizeof(crumbHist) - 1);
+    crumbHist[0] = crashed ? crumb : 0;
+    crumb = 0;
+    WEBLOG("Boot #%lu, reason: %s%s%s", (unsigned long)bootCount, resetName(r),
+           crashed ? ", was in: " : "", crashed ? CRUMB_NAMES[crumbHist[0] < 12 ? crumbHist[0] : 0] : "");
   }
   guardLoad();    // freeze / overheat / dew protections
 
@@ -1742,14 +1775,15 @@ void setup() {
 // what makes acDirty and the getVal/setVal calls race-free. Do not switch to
 // homeSpan.autoPoll() (separate FreeRTOS task) without adding locking.
 void loop() {
-  homeSpan.poll();
-  ac.loop();
+  setCrumb(CR_HOMESPAN); homeSpan.poll();
+  setCrumb(CR_AC);       ac.loop();
   dumpCapabilitiesOnce();
-  dash.handleClient();
-  recorderTick();
-  telemetryTick();
-  comboTick();
-  awayDryTick();
-  guardTick();
-  socketHygieneTick();
+  setCrumb(CR_DASH);     dash.handleClient();
+  setCrumb(CR_RECORDER); recorderTick();
+  setCrumb(CR_TELEMETRY); telemetryTick();
+  setCrumb(CR_COMBO);    comboTick();
+  setCrumb(CR_AWAYDRY);  awayDryTick();
+  setCrumb(CR_GUARD);    guardTick();
+  setCrumb(CR_SOCKETS);  socketHygieneTick();
+  setCrumb(CR_NONE);
 }
