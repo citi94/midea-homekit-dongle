@@ -30,7 +30,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.7.3"
+#define FIRMWARE_VERSION "1.7.5"
 
 using namespace dudanov::midea::ac;
 
@@ -44,7 +44,12 @@ using namespace dudanov::midea::ac;
 #ifndef AC_TX_PIN
 #define AC_TX_PIN 17
 #endif
-// Onboard WS2812 RGB pixel (GPIO48 on most S3 devkits, 21 on S3-Zero boards)
+// Onboard WS2812 RGB pixel (GPIO48 on most S3 devkits, 21 on S3-Zero boards).
+// -1 disables it. HomeSpan drives the pixel from a 1 KB "BlinkTask" that
+// calls the RMT driver; with an interrupt frame on top it overflows now and
+// then (core dump: DoubleException in _xt_context_save, 88 bytes free), so
+// a blink on a HomeKit status change could reboot the dongle. The installed
+// unit's pixel is inside the AC casing anyway, so the OTA env sets -1.
 #ifndef STATUS_PIXEL_PIN
 #define STATUS_PIXEL_PIN 48
 #endif
@@ -1647,7 +1652,8 @@ void setup() {
   WiFi.config(IPAddress(192, 168, 2, 10), IPAddress(192, 168, 2, 1),
               IPAddress(255, 255, 255, 0), IPAddress(192, 168, 2, 1));
 
-  homeSpan.setStatusPixel(PIN_STATUS_PIXEL);
+  if (PIN_STATUS_PIXEL >= 0)
+    homeSpan.setStatusPixel(PIN_STATUS_PIXEL);
   homeSpan.setPairingCode("46637726");  // HomeKit setup code 4663-7726
   homeSpan.enableAutoStartAP();         // no WiFi creds -> "HomeSpan-Setup" AP
   // dongle lives inside the AC, flash over WiFi. Password comes from
@@ -1754,6 +1760,23 @@ void setup() {
   //   curl -o nvs.bin http://192.168.2.10:8080/nvsdump
   //   esptool.py write_flash 0x9000 nvs.bin
   // A restored clone must NEVER run on the same network as the original.
+  // Crash post-mortem: the core writes an ELF core dump to the coredump
+  // partition on panic. Pull it and decode against the matching firmware.elf:
+  //   curl -o core.bin http://192.168.2.10:8080/coredump
+  //   esp-coredump info_corefile --core core.bin --core-format raw firmware.elf
+  dash.on("/coredump", []() {
+    const esp_partition_t* p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, nullptr);
+    if (!p) { dash.send(500, "text/plain", "coredump partition not found"); return; }
+    dash.setContentLength(p->size);
+    dash.send(200, "application/octet-stream", "");
+    WiFiClient client = dash.client();
+    uint8_t buf[1024];
+    for (size_t off = 0; off < p->size; off += sizeof(buf)) {
+      if (esp_partition_read(p, off, buf, sizeof(buf)) != ESP_OK) return;
+      client.write(buf, sizeof(buf));
+    }
+  });
   dash.on("/nvsdump", []() {
     const esp_partition_t* p = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, "nvs");

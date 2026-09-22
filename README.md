@@ -60,8 +60,11 @@ Notes:
 - For flashing/monitoring use the USB-C port that enumerates as a **CH343**
   serial device (the other port is the S3's native USB, unused here).
 - HomeSpan status is shown on the onboard WS2812 RGB pixel (GPIO48; some
-  clone boards route it to GPIO38 — change `PIN_STATUS_PIXEL` if it stays
-  dark).
+  clone boards route it to GPIO38 — change `STATUS_PIXEL_PIN` if it stays
+  dark). The OTA env builds with `-DSTATUS_PIXEL_PIN=-1` (pixel off): once
+  the dongle is inside the AC nobody can see it, and HomeSpan 2.1.8's
+  1 KB blink task can overflow its stack on a status change and reboot
+  the board (found via a core dump — see `/coredump` in `src/main.cpp`).
 - Optional but recommended: a 470–1000 µF electrolytic across 5Vin/GND near
   the board — WiFi transmit bursts through a long thin cable can brown out
   the ESP32.
