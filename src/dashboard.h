@@ -271,8 +271,8 @@ function gRender(g){
   document.getElementById('gSt').textContent=st;
   document.getElementById('gStop').hidden=g.run==='idle';
   var k='';
-  k+=krow('room fabric estimate',fmt(g.mass));
-  k+=krow('dew target (stay above)',fmt(g.dew.target));
+  k+=krow('room fabric estimate (36 h avg)',fmt(g.mass));
+  k+=krow('dew target (fabric must stay above)',fmt(g.dew.target));
   k+=krow('forecast dew point now',fmt(g.wx.dewNow));
   k+=krow('max dew point next 36 h',fmt(g.wx.dewMax));
   k+=krow('outdoor (forecast)',fmt(g.wx.temp));

@@ -30,7 +30,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.7.5"
+#define FIRMWARE_VERSION "1.7.6"
 
 using namespace dudanov::midea::ac;
 
@@ -1245,14 +1245,21 @@ static void handleAwayDry() {
 // releases the unit back to off when done.
 //   freeze    T1 below freezeC   -> heat 17 for an hour
 //   overheat  T1 above overheatC -> cool 25 for an hour
-//   dew       the rust one. After a cold snap the machines and slab sit at
-//             the old temperature; when a wet front arrives with a dew point
-//             above that, every surface sweats. The unit has no humidity
-//             sensor, so the dongle polls Open-Meteo hourly for the dew-point
-//             forecast at the workshop's coordinates and keeps the room above
-//             (highest dew point in the next 36 h + margin). The unit's lowest
-//             setpoint is 17, so the dongle is the thermostat: heat 17 while
-//             T1 is under target, off once it's a degree over, repeat.
+//   dew       the rust one. After days of cold the machines and slab sit at
+//             the old temperature; when a thaw arrives with a dew point above
+//             that, every surface sweats. Dew forms on the *fabric*, not the
+//             air, so the trigger compares the forecast against massTemp (a
+//             36 h average of the room, the proxy for slab/machine temp), not
+//             against T1: an ordinary cool morning dips the air, not the
+//             fabric, and must not fire it (v1.7.5 did, at 08:42 on a mild
+//             day). The unit has no humidity sensor, so the dongle polls
+//             Open-Meteo hourly for the dew-point forecast at the workshop's
+//             coordinates and keeps the fabric above (highest dew point in
+//             the next 36 h + margin). The unit's lowest setpoint is 17, so
+//             the dongle is the thermostat: heat 17 in bursts (air to a
+//             degree over target, rest, repeat) until the fabric estimate
+//             has climbed past target, which for a real cold slab takes a
+//             day or more, as it should.
 //             A measured indoor humidity pushed to /hum?rh=NN sharpens it
 //             (indoor dew point is then used as well as the forecast).
 //   /guard?freeze=1&freezeC=5&overheat=1&overheatC=37&dew=1&dewMargin=2
@@ -1527,7 +1534,8 @@ static void guardTick() {
   if (guard.overheat && t1 > guard.overheatC) { guardStart(2); return; }
   if (guard.dew) {
     const float tgt = dewTarget();
-    if (!isnan(tgt) && t1 < tgt - 0.5f) guardStart(3);
+    const float fabric = isnan(massTemp) ? t1 : massTemp;
+    if (!isnan(tgt) && fabric < tgt - 0.5f) guardStart(3);
   }
 }
 

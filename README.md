@@ -206,14 +206,17 @@ every firing is logged in `/events` as `guard`.
 
 - **Freeze**: indoor below 5 °C → heat 17 °C for an hour.
 - **Overheat**: indoor above 37 °C → cool 25 °C for an hour.
-- **Dew** (the rust one): after a cold snap the machines and floor sit at
-  the old temperature; when a wet front arrives with a dew point above that,
-  every surface sweats. The unit has no humidity sensor, so the dongle polls
+- **Dew** (the rust one): after days of cold the machines and floor sit at
+  the old temperature; when a thaw arrives with a dew point above that,
+  every surface sweats. Dew forms on the fabric, not the air, so the trigger
+  compares the forecast against a 36-hour average of the room temperature
+  (the proxy for slab and machine temperature), which an ordinary cool
+  morning doesn't move. The unit has no humidity sensor, so the dongle polls
   [Open-Meteo](https://open-meteo.com/) hourly (plain HTTP, no key) for the
-  dew-point forecast at the workshop's coordinates and keeps the room above
-  *highest dew point in the next 36 h + margin*. The unit's lowest setpoint
-  is 17, so the dongle acts as the thermostat: heat 17 while the room is
-  under target, off once it's a degree over, repeat. A measured indoor
+  dew-point forecast at the workshop's coordinates and keeps the fabric
+  above *highest dew point in the next 36 h + margin*. The unit's lowest
+  setpoint is 17, so the dongle acts as the thermostat: heat 17 in bursts
+  until the fabric estimate has climbed past target. A measured indoor
   humidity can be pushed to sharpen it (indoor dew point is then used too).
 
 ```sh
