@@ -30,7 +30,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.7.7"
+#define FIRMWARE_VERSION "1.7.8"
 
 using namespace dudanov::midea::ac;
 
@@ -1270,7 +1270,10 @@ static void handleAwayDry() {
 //                     the AC's T1 is used); valid 2 h
 struct GuardCfg {
   bool freeze = true, overheat = true, dew = true;
-  float freezeC = 5.0f, overheatC = 37.0f, dewMargin = 1.0f;
+  float freezeC = 5.0f, overheatC = 37.0f, dewMargin = 0.0f;
+  // Cold gate: the dew guard only arms when the fabric is genuinely cold.
+  // Owner's experience: dew only after weeks near zero then warm wet weather.
+  float dewColdC = 8.0f;
   float lat = 51.228264f, lon = 1.388887f;
 };
 static GuardCfg guard;
@@ -1443,6 +1446,7 @@ static void guardSave() {
   p.putBool("gFr", guard.freeze);   p.putFloat("gFrC", guard.freezeC);
   p.putBool("gOv", guard.overheat); p.putFloat("gOvC", guard.overheatC);
   p.putBool("gDw", guard.dew);      p.putFloat("gDwM", guard.dewMargin);
+  p.putFloat("gDwC", guard.dewColdC);
   p.putFloat("gLat", guard.lat);    p.putFloat("gLon", guard.lon);
   p.end();
 }
@@ -1452,7 +1456,8 @@ static void guardLoad() {
   p.begin("dongle", true);
   guard.freeze = p.getBool("gFr", true);     guard.freezeC = p.getFloat("gFrC", 5.0f);
   guard.overheat = p.getBool("gOv", true);   guard.overheatC = p.getFloat("gOvC", 37.0f);
-  guard.dew = p.getBool("gDw", true);        guard.dewMargin = p.getFloat("gDwM", 1.0f);
+  guard.dew = p.getBool("gDw", true);        guard.dewMargin = p.getFloat("gDwM", 0.0f);
+  guard.dewColdC = p.getFloat("gDwC", 8.0f);
   guard.lat = p.getFloat("gLat", 51.228264f); guard.lon = p.getFloat("gLon", 1.388887f);
   massTemp = p.getFloat("massT", NAN);
   p.end();
@@ -1548,7 +1553,7 @@ static void guardTick() {
   if (guard.dew) {
     const float tgt = dewTarget();
     const float fabric = isnan(massTemp) ? t1 : massTemp;
-    if (!isnan(tgt) && fabric < tgt - 0.5f) guardStart(3);
+    if (!isnan(tgt) && fabric < guard.dewColdC && fabric < tgt - 0.5f) guardStart(3);
   }
 }
 
@@ -1556,9 +1561,9 @@ static void guardJson(String &j) {
   char b[200];
   snprintf(b, sizeof(b),
            "\"guard\":{\"freeze\":{\"on\":%d,\"c\":%.1f},\"overheat\":{\"on\":%d,\"c\":%.1f},"
-           "\"dew\":{\"on\":%d,\"margin\":%.1f,\"target\":",
+           "\"dew\":{\"on\":%d,\"margin\":%.1f,\"coldC\":%.1f,\"target\":",
            guard.freeze, guard.freezeC, guard.overheat, guard.overheatC,
-           guard.dew, guard.dewMargin);
+           guard.dew, guard.dewMargin, guard.dewColdC);
   j += b;
   jsonNum(j, dewTarget());
   j += "},\"mass\":"; jsonNum(j, massTemp);
@@ -1604,7 +1609,8 @@ static void handleGuard() {
   if (dash.hasArg("dew")) guard.dew = dash.arg("dew") == "1";
   guard.freezeC = argF("freezeC", guard.freezeC, -5, 15);
   guard.overheatC = argF("overheatC", guard.overheatC, 25, 45);
-  guard.dewMargin = argF("dewMargin", guard.dewMargin, 0, 6);
+  guard.dewMargin = argF("dewMargin", guard.dewMargin, -3, 6);
+  guard.dewColdC = argF("dewColdC", guard.dewColdC, 0, 25);
   const float lat = argF("lat", guard.lat, -90, 90), lon = argF("lon", guard.lon, -180, 180);
   const bool moved = lat != guard.lat || lon != guard.lon;
   guard.lat = lat; guard.lon = lon;

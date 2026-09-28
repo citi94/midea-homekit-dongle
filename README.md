@@ -206,7 +206,9 @@ every firing is logged in `/events` as `guard`.
 
 - **Freeze**: indoor below 5 °C → heat 17 °C for an hour.
 - **Overheat**: indoor above 37 °C → cool 25 °C for an hour.
-- **Dew** (the rust one): after days of cold the machines and floor sit at
+- **Dew** (the rust one, armed only while the fabric estimate is below
+  8 °C — in the owner's experience dew only follows weeks near zero and a
+  warm wet front): after days of cold the machines and floor sit at
   the old temperature; when a thaw arrives with a dew point above that,
   every surface sweats. Dew forms on the fabric, not the air, so the trigger
   compares the forecast against a 36-hour average of the room temperature
@@ -221,7 +223,7 @@ every firing is logged in `/events` as `guard`.
 
 ```sh
 curl 'http://192.168.2.10:8080/guard'                         # status JSON (incl. "why" it last fired)
-curl 'http://192.168.2.10:8080/guard?dew=1&dewMargin=1&lat=51.23&lon=1.39'
+curl 'http://192.168.2.10:8080/guard?dew=1&dewMargin=0&dewColdC=8&lat=51.23&lon=1.39'
 curl 'http://192.168.2.10:8080/guard?stop=1'                  # cancel a run
 curl 'http://192.168.2.10:8080/guard?snooze=8'                # hours; 0 clears
 curl 'http://192.168.2.10:8080/hum?rh=55'                     # push indoor RH

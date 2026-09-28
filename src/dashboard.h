@@ -123,7 +123,7 @@ canvas{width:100%;height:220px;display:block}
   <div class="ad" id="gd">
     <span><label><input type="checkbox" id="gFr"> freeze</label> below <input id="gFrC" type="number" step="0.5">° → heat 17° for 1 h</span>
     <span><label><input type="checkbox" id="gOv"> overheat</label> above <input id="gOvC" type="number" step="0.5">° → cool 25° for 1 h</span>
-    <span><label><input type="checkbox" id="gDw"> dew</label> keep room above forecast dew point + <input id="gDwM" type="number" step="0.5">°</span>
+    <span><label><input type="checkbox" id="gDw"> dew</label> when fabric is below <input id="gDwC" type="number" step="0.5">°, keep it above forecast dew point + <input id="gDwM" type="number" step="0.5">°</span>
     <button class="btn" onclick="gSave()">Save</button>
     <button class="btn" id="gStop" onclick="fetch('/guard?stop=1').then(poll)" hidden>Stop protection</button>
     <button class="btn" id="gSnooze" onclick="fetch('/guard?snooze='+(D.guard.snooze?0:8)).then(poll)">Snooze 8 h</button>
@@ -257,7 +257,7 @@ function gSave(){
   var v=function(id){return document.getElementById(id).value};
   var c=function(id){return document.getElementById(id).checked?1:0};
   fetch('/guard?freeze='+c('gFr')+'&freezeC='+v('gFrC')+'&overheat='+c('gOv')+'&overheatC='+v('gOvC')+
-    '&dew='+c('gDw')+'&dewMargin='+v('gDwM')).then(function(){poll()});
+    '&dew='+c('gDw')+'&dewMargin='+v('gDwM')+'&dewColdC='+v('gDwC')).then(function(){poll()});
 }
 function ago(s){return s<90?s+' s':s<5400?Math.round(s/60)+' min':Math.round(s/360)/10+' h'}
 function gRender(g){
@@ -265,7 +265,7 @@ function gRender(g){
   var set=function(id,val,chk){var e=document.getElementById(id);if(document.activeElement===e)return;
     if(chk)e.checked=!!val;else e.value=val};
   set('gFr',g.freeze.on,1);set('gFrC',g.freeze.c);set('gOv',g.overheat.on,1);set('gOvC',g.overheat.c);
-  set('gDw',g.dew.on,1);set('gDwM',g.dew.margin);
+  set('gDw',g.dew.on,1);set('gDwM',g.dew.margin);set('gDwC',g.dew.coldC);
   var st=g.run!=='idle'?g.run+' protection running, '+ago(g.ran)+' in':
     (g.cooldown?'idle, cooldown '+ago(g.cooldown):'idle');
   if(g.last!=='idle')st+=' · last fired: '+g.last+' '+ago(g.lastAgo)+' ago'+(g.why?' — '+g.why:'');
