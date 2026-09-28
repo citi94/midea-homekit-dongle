@@ -30,7 +30,7 @@
 #define OTA_PASSWORD "homespan-ota"  // HomeSpan default; see src/secrets.example.h
 #endif
 
-#define FIRMWARE_VERSION "1.7.6"
+#define FIRMWARE_VERSION "1.7.7"
 
 using namespace dudanov::midea::ac;
 
@@ -1270,15 +1270,18 @@ static void handleAwayDry() {
 //                     the AC's T1 is used); valid 2 h
 struct GuardCfg {
   bool freeze = true, overheat = true, dew = true;
-  float freezeC = 5.0f, overheatC = 37.0f, dewMargin = 2.0f;
+  float freezeC = 5.0f, overheatC = 37.0f, dewMargin = 1.0f;
   float lat = 51.228264f, lon = 1.388887f;
 };
 static GuardCfg guard;
 static constexpr uint32_t GUARD_RUN_MS = 60UL * 60000UL;       // freeze/overheat
 static constexpr uint32_t GUARD_DEW_MIN_MS = 20UL * 60000UL;   // shortest dew burst
 static constexpr uint32_t GUARD_COOLDOWN_MS = 30UL * 60000UL;
-static constexpr uint32_t GUARD_DEW_COOLDOWN_MS = 10UL * 60000UL;
-static constexpr uint32_t GUARD_YIELD_COOLDOWN_MS = 60UL * 60000UL;
+// Between dew bursts the unit must rest longer than the 10 min after which
+// the fabric estimate starts sampling the real room again, or the estimate
+// never moves and the campaign never ends (v1.7.6 heated all day on 28 Sep).
+static constexpr uint32_t GUARD_DEW_COOLDOWN_MS = 45UL * 60000UL;
+static constexpr uint32_t GUARD_YIELD_COOLDOWN_MS = 6UL * 3600000UL;  // a human touched it: leave them the day
 static constexpr float MASS_TAU_S = 36.0f * 3600.0f;           // fabric-temp EMA
 static constexpr int WX_LOOKAHEAD_H = 36;
 
@@ -1293,6 +1296,8 @@ static uint8_t guardRun = 0;                 // GUARD_NAMES index, 0 = idle
 static uint32_t guardRunMs = 0, guardAssertMs = 0, guardCooldownUntil = 0;
 static uint8_t guardLast = 0;                // last thing that fired
 static uint32_t guardLastMs = 0;
+static char guardWhy[96] = "";               // the numbers behind the last firing
+static uint32_t guardSnoozeUntil = 0;        // /guard?snooze=<hours>
 static uint32_t acLastOnMs = 0, massSavedMs = 0;
 
 // -- weather fetch runs in its own task so a slow HTTP round-trip never stalls
@@ -1447,7 +1452,7 @@ static void guardLoad() {
   p.begin("dongle", true);
   guard.freeze = p.getBool("gFr", true);     guard.freezeC = p.getFloat("gFrC", 5.0f);
   guard.overheat = p.getBool("gOv", true);   guard.overheatC = p.getFloat("gOvC", 37.0f);
-  guard.dew = p.getBool("gDw", true);        guard.dewMargin = p.getFloat("gDwM", 2.0f);
+  guard.dew = p.getBool("gDw", true);        guard.dewMargin = p.getFloat("gDwM", 1.0f);
   guard.lat = p.getFloat("gLat", 51.228264f); guard.lon = p.getFloat("gLon", 1.388887f);
   massTemp = p.getFloat("massT", NAN);
   p.end();
@@ -1464,8 +1469,15 @@ static void guardStart(uint8_t what) {
   guardRunMs = guardAssertMs = millis();
   guardLast = what;
   guardLastMs = millis();
+  const float t1 = ac.getIndoorTemp();
+  if (what == 3)
+    snprintf(guardWhy, sizeof(guardWhy), "fabric %.1f below target %.1f (forecast dew %.1f + %.1f margin), room %.1f",
+             isnan(massTemp) ? t1 : massTemp, dewTarget(), wxFresh() ? wxDewMax : NAN, guard.dewMargin, t1);
+  else
+    snprintf(guardWhy, sizeof(guardWhy), "room %.1f %s %.1f limit", t1, what == 1 ? "below" : "above",
+             what == 1 ? guard.freezeC : guard.overheatC);
   logEvent(EV_GUARD, 0, what);
-  WEBLOG("Guardian: %s protection on (T1 %.1fC)", GUARD_NAMES[what], ac.getIndoorTemp());
+  WEBLOG("Guardian: %s protection on: %s", GUARD_NAMES[what], guardWhy);
 }
 
 static void guardStop(bool yielded) {
@@ -1528,6 +1540,7 @@ static void guardTick() {
   }
 
   if ((int32_t)(now - guardCooldownUntil) < 0) return;
+  if (guardSnoozeUntil && (int32_t)(now - guardSnoozeUntil) < 0) return;
   const bool standby = !power && !awayDryOn && !mideaService->pendingValid;
   if (!standby) return;
   if (guard.freeze && t1 < guard.freezeC) { guardStart(1); return; }
@@ -1561,12 +1574,16 @@ static void guardJson(String &j) {
   j += ",\"dew\":"; jsonNum(j, humFresh() ? humDew() : NAN);
   const int32_t cd = (int32_t)(guardCooldownUntil - millis());
   snprintf(b, sizeof(b),
-           ",\"age\":%lu},\"run\":\"%s\",\"ran\":%lu,\"last\":\"%s\",\"lastAgo\":%lu,\"cooldown\":%ld},",
+           ",\"age\":%lu},\"run\":\"%s\",\"ran\":%lu,\"last\":\"%s\",\"lastAgo\":%lu,\"cooldown\":%ld,",
            (unsigned long)(humAtMs ? (millis() - humAtMs) / 1000 : 0), GUARD_NAMES[guardRun],
            (unsigned long)(guardRun ? (millis() - guardRunMs) / 1000 : 0),
            GUARD_NAMES[guardLast], (unsigned long)(guardLastMs ? (millis() - guardLastMs) / 1000 : 0),
            (long)(cd > 0 ? cd / 1000 : 0));
   j += b;
+  const int32_t sn = (int32_t)(guardSnoozeUntil - millis());
+  j += "\"why\":\""; j += guardWhy; j += "\",\"snooze\":";
+  j += String((long)(guardSnoozeUntil && sn > 0 ? sn / 1000 : 0));
+  j += "},";
 }
 
 static float argF(const char *k, float cur, float lo, float hi) {
@@ -1577,6 +1594,11 @@ static float argF(const char *k, float cur, float lo, float hi) {
 
 static void handleGuard() {
   if (dash.arg("stop") == "1") guardStop(false);
+  if (dash.hasArg("snooze")) {  // hours; 0 clears
+    const long h = dash.arg("snooze").toInt();
+    guardSnoozeUntil = h > 0 ? millis() + (uint32_t)constrain(h, 1, 72) * 3600000UL : 0;
+    if (h > 0) guardStop(false);
+  }
   if (dash.hasArg("freeze")) guard.freeze = dash.arg("freeze") == "1";
   if (dash.hasArg("overheat")) guard.overheat = dash.arg("overheat") == "1";
   if (dash.hasArg("dew")) guard.dew = dash.arg("dew") == "1";

@@ -220,11 +220,15 @@ every firing is logged in `/events` as `guard`.
   humidity can be pushed to sharpen it (indoor dew point is then used too).
 
 ```sh
-curl 'http://192.168.2.10:8080/guard'                         # status JSON
-curl 'http://192.168.2.10:8080/guard?dew=1&dewMargin=2&lat=51.23&lon=1.39'
+curl 'http://192.168.2.10:8080/guard'                         # status JSON (incl. "why" it last fired)
+curl 'http://192.168.2.10:8080/guard?dew=1&dewMargin=1&lat=51.23&lon=1.39'
 curl 'http://192.168.2.10:8080/guard?stop=1'                  # cancel a run
+curl 'http://192.168.2.10:8080/guard?snooze=8'                # hours; 0 clears
 curl 'http://192.168.2.10:8080/hum?rh=55'                     # push indoor RH
 ```
+
+Any manual change to the unit (remote or HomeKit) while a guard is running
+stands the guardian down for six hours.
 
 ## Debugging
 

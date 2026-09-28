@@ -126,6 +126,7 @@ canvas{width:100%;height:220px;display:block}
     <span><label><input type="checkbox" id="gDw"> dew</label> keep room above forecast dew point + <input id="gDwM" type="number" step="0.5">°</span>
     <button class="btn" onclick="gSave()">Save</button>
     <button class="btn" id="gStop" onclick="fetch('/guard?stop=1').then(poll)" hidden>Stop protection</button>
+    <button class="btn" id="gSnooze" onclick="fetch('/guard?snooze='+(D.guard.snooze?0:8)).then(poll)">Snooze 8 h</button>
     <span class="st" id="gSt">–</span>
   </div>
   <div class="kgrid" id="ggrid"></div>
@@ -267,7 +268,9 @@ function gRender(g){
   set('gDw',g.dew.on,1);set('gDwM',g.dew.margin);
   var st=g.run!=='idle'?g.run+' protection running, '+ago(g.ran)+' in':
     (g.cooldown?'idle, cooldown '+ago(g.cooldown):'idle');
-  if(g.last!=='idle')st+=' · last fired: '+g.last+' '+ago(g.lastAgo)+' ago';
+  if(g.last!=='idle')st+=' · last fired: '+g.last+' '+ago(g.lastAgo)+' ago'+(g.why?' — '+g.why:'');
+  if(g.snooze)st+=' · snoozed for '+ago(g.snooze);
+  document.getElementById('gSnooze').textContent=g.snooze?'Unsnooze':'Snooze 8 h';
   document.getElementById('gSt').textContent=st;
   document.getElementById('gStop').hidden=g.run==='idle';
   var k='';
